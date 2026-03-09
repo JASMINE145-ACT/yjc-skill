@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 inventory-price-query Skill 入口脚本。
-与 Agent Team version3 完全一致：报价单+万鼎（历史+万鼎并集）+ LLM 选型 + 查库存。
 
-运行模式（自动选择）：
-  HTTP 模式（优先）：设置 BASE_URL 环境变量指向已部署的 v3 后端，调 POST /api/query。
-    - 另一台电脑只需 BASE_URL + pip install requests，与其他 3 个 Skill 一致。
-  本地模式（兜底）：在 Agent Team version3 根目录下执行，或设置 AGENT_TEAM_V3_ROOT。
-    - 直接 import Python 模块，需要本地 v3 源码 + 数据文件 + 所有环境变量。
+架构原则：v3 后端是唯一真源，本脚本只是薄封装。
+  HTTP 模式（主推）：设置 BASE_URL → 直接 POST /api/query，行为与 Web UI 完全一致，
+    不在脚本里做任何选型/解析逻辑。另一台电脑只需 BASE_URL + pip install requests。
+  本地模式（debug 后门）：无 BASE_URL 且能找到 v3 源码时启用，
+    直接 import v3 Python 模块执行，仅供开发调试，不对外宣传。
 
-输入：stdin 或第一参数文件，JSON { "query": "自然语言" } 或 { "product_name", "spec", "customer_level", "use_quotation_union"? }。
-输出：stdout 统一 JSON { "success", "data": { "items", "explanation" }, "error"? }。
+输入：stdin 或第一参数文件，JSON { "query": "自然语言" } 或 { "product_name", "spec", "customer_level" }。
+输出：
+  HTTP 模式：{ "success", "data": { "explanation": "<v3 完整回答>" }, "error"? }
+  本地模式：{ "success", "data": { "items": [...], "explanation": "..." }, "error"? }
 """
 from __future__ import annotations
 
@@ -48,49 +49,40 @@ def _resolve_v3_root() -> str | None:
 # ──────────────────────────────────────────────
 
 def _run_http(phrase: str, customer_level: str) -> None:
-    """POST /api/query → 返回 agent 自然语言答案作为 explanation。"""
+    """薄封装：POST /api/query，行为与 Web UI/企微入口完全一致，脚本内不做任何业务逻辑。"""
     try:
         import requests
     except ImportError:
         _out({"success": False, "error": {"code": "no_requests", "message": "请安装 requests: pip install requests"}})
         sys.exit(1)
 
-    # 在 query 里带上档位信息，让 agent 走完整流程（match_quotation + select + get_inventory）
-    full_query = phrase
-    if customer_level and customer_level != "B":
-        full_query = f"{phrase} {customer_level}档价格"
+    # 非默认档位时自然融入 query，由 v3 agent 自行识别
+    query = phrase
+    if customer_level and customer_level.upper() != "B":
+        query = f"{phrase} {customer_level}档价格"
 
     try:
         resp = requests.post(
             f"{BASE_URL}/api/query",
-            json={"query": full_query},
-            timeout=60,
+            json={"query": query},
+            timeout=180,
         )
+        resp.raise_for_status()
         data = resp.json()
-        if resp.status_code != 200 or not data.get("success"):
-            _out({
-                "success": False,
-                "error": {"code": "api_error", "message": data.get("error") or resp.text[:300]},
-            })
+        if not data.get("success"):
+            _out({"success": False, "error": {"code": "api_error", "message": data.get("error") or str(data)[:300]}})
             sys.exit(1)
         answer = (data.get("data") or {}).get("answer") or ""
-        _out({
-            "success": True,
-            "data": {
-                # HTTP 模式下 items 结构化字段不可用（agent 返回自然语言）
-                "items": [{"name": phrase, "code": "", "customer_level": customer_level,
-                           "unit_price_incl_tax": None, "unit_price_excl_tax": None,
-                           "available_qty": None, "specification": ""}],
-                "explanation": answer,
-            },
-        })
+        _out({"success": True, "data": {"explanation": answer}})
     except Exception as e:
         _out({"success": False, "error": {"code": "runtime_error", "message": str(e)}})
         sys.exit(1)
 
 
 # ──────────────────────────────────────────────
-# 本地模式（直接 import v3 Python 模块）
+# 本地模式（debug 后门，不对外宣传）
+# 直接 import v3 Python 模块，需本地 v3 源码 + 数据文件 + 完整环境变量。
+# 生产/分发环境请统一使用 HTTP 模式（BASE_URL）。
 # ──────────────────────────────────────────────
 
 def _parse_price_result(price_text: str):

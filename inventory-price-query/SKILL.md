@@ -18,13 +18,18 @@ description: "统一查询产品价格与库存：先由 inventory_agent（Resol
 2. **查库存**：用上一步得到的 `code` 调用 `get_inventory_by_code(code)` 查库存；仅当未匹配到（无 code）时才退化为 `search_inventory(keywords)`（Resolver → table_agent）。
 3. **拼装**：合并价格与库存结果输出统一 JSON。不写 Neon。
 
+## 架构原则
+
+**v3 后端是唯一真源**。本 Skill 只是薄封装，不在脚本里重复实现任何业务逻辑。
+- 企微机器人 / OpenClaw / Cursor Skill 三条链路，统一指向同一个 v3 HTTP 接口，行为天然一致。
+
 ## 可执行脚本（供另一 LLM 直接调用）
 
-执行 **scripts/run.py** 完成一次查询。脚本自动选择运行模式：
+执行 **scripts/run.py** 完成一次查询。
 
-### 模式 1：HTTP 模式（推荐，与其他 3 个 Skill 一致）
+### 模式 1：HTTP 模式（主推）
 
-设置 `BASE_URL` 环境变量指向已部署的 v3 后端即可，**无需本地 v3 源码**。
+设置 `BASE_URL` 指向已部署的 v3 后端，**无需本地 v3 源码**。
 
 ```bash
 export BASE_URL=http://your-backend:8000   # 或 set BASE_URL=... (Windows)
@@ -32,53 +37,53 @@ pip install requests
 echo '{"query":"直接 dn50 B档价格"}' | python scripts/run.py
 ```
 
-- 依赖：Python 3 + `requests`
-- 环境变量：只需 `BASE_URL`
-- 内部走 `POST /api/query`，由服务端完整执行 match_quotation → select_wanding_match → get_inventory_by_code
-- 输出中 `items[]` 字段不含结构化 code/price（agent 返回自然语言），完整信息在 `explanation`
+- 依赖：Python 3 + `requests`，只需 `BASE_URL`
+- 内部走 `POST /api/query`，由 v3 服务端完整执行（ReAct agent → match_quotation → select_wanding_match → get_inventory_by_code）
+- 脚本内**不做任何选型/解析**，结果与 Web UI 完全一致
+- 输出：`{ "success": true, "data": { "explanation": "<v3 完整回答>" } }`
 
-### 模式 2：本地模式（有 v3 源码时）
+### 模式 2：本地模式（debug 后门，不对外宣传）
 
-不设 `BASE_URL`，脚本自动检测本地 v3 根目录。
+不设 `BASE_URL`，脚本自动检测本地 v3 根目录，直接 import v3 Python 模块。
 
 ```bash
 # 在 Agent Team version3 根目录下
 python /path/to/inventory-price-query/scripts/run.py <<< '{"query":"PVC 管 dn20 B 档"}'
 ```
 
-- 依赖：本地 v3 源码 + 数据文件（价格库 Excel、映射表）+ 环境变量（ZHIPU_API_KEY、AOL_ACCESS_TOKEN 等）
-- 输出中 `items[]` 含结构化 code / unit_price_incl_tax
+- 依赖：本地 v3 源码 + 数据文件 + 完整环境变量（ZHIPU_API_KEY、AOL_ACCESS_TOKEN 等）
+- 输出含结构化 `items[]`（code / unit_price_incl_tax）
 
 ---
 
 **输入格式**（两种模式通用）：
 - `{ "query": "自然语言描述" }`
 - `{ "product_name": "...", "spec": "...", "customer_level": "B" }`
-- 可选 `"use_quotation_union": true`（默认，本地模式有效）：先走历史+万鼎并集；`false` 则仅用万鼎。
 
 ## 输出格式
 
+HTTP 模式：
 ```json
 {
   "success": true,
   "data": {
-    "items": [
-      {
-        "name": "产品名称",
-        "code": "物料编码",
-        "customer_level": "B",
-        "unit_price_incl_tax": 12.5,
-        "unit_price_excl_tax": null,
-        "available_qty": null,
-        "specification": "dn20"
-      }
-    ],
-    "explanation": "库存格式化文本，含具体可售数量，如：#C11 Tee dn20 库存有 50"
+    "explanation": "v3 agent 完整回答，含价格、库存、匹配来源等"
   }
 }
 ```
 
-> `available_qty` 固定为 `null`；实际库存数量以文本形式在 `explanation` 中。调用方 LLM 可直接读 `explanation` 展示给用户。
+本地模式：
+```json
+{
+  "success": true,
+  "data": {
+    "items": [{ "name": "...", "code": "...", "unit_price_incl_tax": 12.5, ... }],
+    "explanation": "库存格式化文本"
+  }
+}
+```
+
+调用方 LLM 读 `data.explanation` 展示给用户即可。
 
 失败时：`{ "success": false, "error": { "code": "...", "message": "..." } }`。
 
